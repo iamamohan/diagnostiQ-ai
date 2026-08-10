@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+backend/.venv/
+backend/venv/
+
+# Frontend dependencies/build cache
+node_modules/
+frontend/node_modules/
+frontend/.git_frontend_backup/
+
+# Environment and local settings
+.env
+.env.*
+
+# Uploaded/generated report files
+backend/uploads/*.pdf
+backend/uploads/*.docx
+backend/uploads/*.txt
+
+# OS/editor
+.DS_Store
+Thumbs.db
+
+# Accidental root npm lockfile
+/package-lock.json
+node_modules/
+backend/node_modules/
+venv/
+backend/venv/
+.env
+__pycache__/

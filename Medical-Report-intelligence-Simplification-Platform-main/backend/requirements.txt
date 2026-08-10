@@ -1,0 +1,9 @@
+flask
+flask-cors
+pymupdf
+pytesseract
+pillow
+transformers
+torch
+sentencepiece
+deep-translator

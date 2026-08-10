@@ -1,0 +1,12 @@
+Patient Name: Demo User
+Age: 48
+
+Blood Sugar: 180 mg/dL (70-140)
+Hemoglobin: 10.5 g/dL (12-17)
+Total Cholesterol: 245 mg/dL (125-200)
+HDL: 35 mg/dL (40-90)
+Creatinine: 1.1 mg/dL (0.6-1.3)
+
+Impression:
+Patient has elevated blood sugar and abnormal lipid profile. Low HDL observed.
+Clinical correlation advised.
