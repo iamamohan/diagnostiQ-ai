@@ -21,10 +21,14 @@ from utils import (
     detect_report_type_by_keywords,
     load_medical_ranges,
     parameter_explanation,
+    BIOMARKER_CLINICAL_DETAILS,
+    MEDICATION_INTERACTIONS_DATA,
+    build_doctor_consultation_questions,
+    screen_medication_interactions,
 )
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -149,25 +153,41 @@ def normalize_extracted_text(text):
     if not text:
         return ""
 
-    # Make OCR/table text parser-friendly:
-    # 1) insert spaces between letters and numbers (HbA1c5.5 -> HbA1c 5.5)
-    normalized = text
+    import re
+
+    # Standardize line breaks
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     normalized = normalized.replace("\u00a0", " ")
-    normalized = normalized.replace("|", " ")
     normalized = normalized.replace("\t", " ")
+
+    # Expand common bullet markers into clean line breaks
+    normalized = normalized.replace("•", "\n")
+    normalized = normalized.replace("●", "\n")
+    normalized = normalized.replace("▪", "\n")
+    normalized = normalized.replace("|", " ")
+
+    # Add spacing around medical units for regex matching
     normalized = normalized.replace("mg/dL", " mg/dL ")
     normalized = normalized.replace("g/dL", " g/dL ")
     normalized = normalized.replace("mmHg", " mmHg ")
     normalized = normalized.replace("%", " % ")
 
-    import re
-
+    # Insert spaces between letters and numbers (HbA1c5.5 -> HbA1c 5.5)
     normalized = re.sub(r"([A-Za-z])([0-9])", r"\1 \2", normalized)
     normalized = re.sub(r"([0-9])([A-Za-z])", r"\1 \2", normalized)
-    normalized = re.sub(r"\s+", " ", normalized)
-    normalized = re.sub(r"\s*\n\s*", "\n", normalized)
 
-    return normalized.strip()
+    # Normalize horizontal whitespace per line without destroying line breaks
+    clean_lines = []
+    for line in normalized.split("\n"):
+        cl = re.sub(r"[ \t]+", " ", line).strip()
+        if cl:
+            clean_lines.append(cl)
+
+    # Rejoin with clean line breaks
+    result = "\n".join(clean_lines)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
 
 
 def coerce_text_input(value):
@@ -212,51 +232,119 @@ def normalize_language(lang):
     return "en"
 
 
+TRANSLATION_CACHE = {}
+
+
 def translate_text(text, lang):
     if not text or lang == "en":
         return text
 
-    # Primary translation path: deep-translator (Google) for reliable multilingual output.
+    clean_text = str(text).strip()
+    if not clean_text:
+        return text
+
+    cache_key = (clean_text, lang)
+    if cache_key in TRANSLATION_CACHE:
+        return TRANSLATION_CACHE[cache_key]
+
+    target = GOOGLE_LANG_CODES.get(lang, lang)
+
+    # 1. Primary: Google GTX direct endpoint (free, fast)
+    try:
+        import requests
+        import urllib.parse
+
+        encoded = urllib.parse.quote(clean_text)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target}&dt=t&q={encoded}"
+        resp = requests.get(url, timeout=4, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
+                translated = "".join([part[0] for part in data[0] if part and part[0]]).strip()
+                if translated:
+                    TRANSLATION_CACHE[cache_key] = translated
+                    return translated
+    except Exception:
+        pass
+
+    # 2. Secondary fallback: MyMemoryTranslator
+    try:
+        from deep_translator import MyMemoryTranslator
+
+        lang_map = {"hi": "hi-IN", "ta": "ta-IN"}
+        t_lang = lang_map.get(lang, target)
+        translated = MyMemoryTranslator(source="en-US", target=t_lang).translate(clean_text[:450])
+        if translated:
+            TRANSLATION_CACHE[cache_key] = str(translated).strip()
+            return str(translated).strip()
+    except Exception:
+        pass
+
+    # 3. Tertiary fallback: GoogleTranslator from deep-translator
     if GoogleTranslator is not None:
         try:
-            target = GOOGLE_LANG_CODES.get(lang, "en")
-            # GoogleTranslator handles moderate-length text well; keep chunk size safe.
-            chunks = []
-            raw = text.strip()
-            while len(raw) > 4500:
-                split_at = raw.rfind("\n", 0, 4500)
-                if split_at <= 0:
-                    split_at = raw.rfind(" ", 0, 4500)
-                if split_at <= 0:
-                    split_at = 4500
-                chunks.append(raw[:split_at])
-                raw = raw[split_at:].lstrip()
-            if raw:
-                chunks.append(raw)
-
-            translated_chunks = []
-            for c in chunks:
-                translated_chunks.append(
-                    GoogleTranslator(source="en", target=target).translate(c)
-                )
-            translated = "\n".join(translated_chunks).strip()
+            translated = GoogleTranslator(source="en", target=target).translate(clean_text[:500])
             if translated:
-                return translated
+                TRANSLATION_CACHE[cache_key] = str(translated).strip()
+                return str(translated).strip()
         except Exception:
             pass
 
-    # Fallback translation path: FLAN prompt-based translation.
+    return text
+
+
+def batch_translate_texts(texts, lang):
+    """Translate a list of strings in a single batch request for maximum speed and reliability."""
+    if not texts or lang == "en":
+        return texts
+
+    results = list(texts)
+    to_translate_indices = []
+    to_translate_texts = []
+
+    for i, t in enumerate(texts):
+        if not t or not str(t).strip():
+            continue
+        clean = str(t).strip()
+        cache_key = (clean, lang)
+        if cache_key in TRANSLATION_CACHE:
+            results[i] = TRANSLATION_CACHE[cache_key]
+        else:
+            to_translate_indices.append(i)
+            to_translate_texts.append(clean)
+
+    if not to_translate_texts:
+        return results
+
+    target = GOOGLE_LANG_CODES.get(lang, lang)
+
+    # 1. Primary: Google GTX single batch request
     try:
-        ensure_models_loaded()
-        target_lang = LANGUAGE_LABELS.get(lang, "English")
-        prompt = (
-            f"Translate the following healthcare guidance text to {target_lang}. "
-            "Keep meaning exact and simple for patients. Return only translated text.\n\n"
-            f"Text:\n{text[:1500]}"
-        )
-        return ask_flan(prompt, max_input_tokens=1024, max_new_tokens=300)
+        import requests
+        import urllib.parse
+
+        combined = "\n|||\n".join(to_translate_texts)
+        encoded = urllib.parse.quote(combined)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target}&dt=t&q={encoded}"
+        resp = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
+                full_trans = "".join([part[0] for part in data[0] if part and part[0]]).strip()
+                translated_parts = [p.strip() for p in full_trans.split("|||")]
+                if len(translated_parts) == len(to_translate_texts):
+                    for idx, orig_text, trans_text in zip(to_translate_indices, to_translate_texts, translated_parts):
+                        TRANSLATION_CACHE[(orig_text, lang)] = trans_text
+                        results[idx] = trans_text
+                    return results
     except Exception:
-        return text
+        pass
+
+    # 2. Fallback: Translate remaining missing items individually
+    for idx, orig_text in zip(to_translate_indices, to_translate_texts):
+        results[idx] = translate_text(orig_text, lang)
+
+    return results
 
 
 def localize_analysis_payload(response_data, lang):
@@ -265,22 +353,52 @@ def localize_analysis_payload(response_data, lang):
         response_data["translation_engine"] = "none"
         return response_data
 
-    response_data["one_line_summary"] = translate_text(response_data.get("one_line_summary", ""), lang)
-    response_data["summary"] = translate_text(response_data.get("summary", ""), lang)
-    response_data["simple_explanation"] = translate_text(response_data.get("simple_explanation", ""), lang)
-    response_data["why_it_matters"] = translate_text(response_data.get("why_it_matters", ""), lang)
-
+    # Collect all items for single batch translation
+    narratives = [
+        response_data.get("one_line_summary", ""),
+        response_data.get("summary", ""),
+        response_data.get("simple_explanation", ""),
+        response_data.get("why_it_matters", ""),
+    ]
     suggestions = response_data.get("suggestions", [])
-    response_data["suggestions"] = [translate_text(item, lang) for item in suggestions]
-
+    alerts = response_data.get("alerts", [])
+    doctor_questions = response_data.get("doctor_questions", [])
     rows = response_data.get("parameters", [])
-    for row in rows:
-        row["result_line"] = translate_text(row.get("result_line", ""), lang)
-        row["explanation"] = translate_text(row.get("explanation", ""), lang)
+    result_lines = [r.get("result_line", "") for r in rows]
+
+    all_texts = narratives + suggestions + alerts + doctor_questions + result_lines
+    translated_all = batch_translate_texts(all_texts, lang)
+
+    n_len = len(narratives)
+    s_len = len(suggestions)
+    a_len = len(alerts)
+    dq_len = len(doctor_questions)
+
+    # Unpack translated narratives
+    response_data["one_line_summary"] = translated_all[0]
+    response_data["summary"] = translated_all[1]
+    response_data["simple_explanation"] = translated_all[2]
+    response_data["why_it_matters"] = translated_all[3]
+
+    # Unpack suggestions
+    response_data["suggestions"] = translated_all[n_len : n_len + s_len]
+
+    # Unpack alerts
+    response_data["alerts"] = translated_all[n_len + s_len : n_len + s_len + a_len]
+
+    # Unpack doctor consultation questions
+    response_data["doctor_questions"] = translated_all[n_len + s_len + a_len : n_len + s_len + a_len + dq_len]
+
+    # Unpack parameter explanations
+    trans_lines = translated_all[n_len + s_len + a_len + dq_len :]
+    for i, row in enumerate(rows):
+        if i < len(trans_lines):
+            row["result_line"] = trans_lines[i]
+            row["explanation"] = trans_lines[i]
 
     response_data["abnormal_values"] = rows
     response_data["language"] = lang
-    response_data["translation_engine"] = "google" if GoogleTranslator is not None else "flan-fallback"
+    response_data["translation_engine"] = "gtx-batch"
     return response_data
 
 
@@ -497,6 +615,7 @@ def index():
 
 
 @app.route("/health", methods=["GET"])
+@app.route("/api/health", methods=["GET"])
 def health():
     return jsonify(
         {
@@ -510,6 +629,7 @@ def health():
 
 
 @app.route("/upload", methods=["POST"])
+@app.route("/api/upload", methods=["POST"])
 def upload_file():
     files = request.files.getlist("files")
     if not files:
@@ -565,6 +685,7 @@ def upload_file():
 
 
 @app.route("/analyze", methods=["POST"])
+@app.route("/api/analyze", methods=["POST"])
 def analyze_text():
     data = request.get_json() or {}
     text = coerce_text_input(data.get("text", ""))
@@ -575,11 +696,17 @@ def analyze_text():
     if report_id and not text:
         stored = REPORT_STORE.get(report_id)
         if not stored:
-            return jsonify({"error": "Invalid report_id."}), 404
+            return jsonify({"error": "Report session expired or invalid report ID. Please re-select or re-upload your report."}), 404
         text = stored["text"]
 
+    if report_id and text:
+        REPORT_STORE[report_id] = {
+            "filename": "report.pdf",
+            "text": text,
+        }
+
     if not text.strip():
-        return jsonify({"error": "No text provided"}), 400
+        return jsonify({"error": "No clinical text provided. Please upload a report file or paste diagnostic text."}), 400
 
     try:
         report_type = detect_report_type(text)
@@ -595,6 +722,22 @@ def analyze_text():
 
         parameter_rows = []
         for row in abnormal_values:
+            name = row["name"]
+            name_lower = name.lower()
+            canonical_key = None
+            for k in BIOMARKER_CLINICAL_DETAILS:
+                if k in name_lower or name_lower in k:
+                    canonical_key = k
+                    break
+
+            meta = BIOMARKER_CLINICAL_DETAILS.get(canonical_key, {
+                "organ_system": "General Physiology",
+                "clinical_function": f"Clinical biomarker tracking {name} homeostasis.",
+                "high_implications": f"Elevated {name} exceeds standard physiological range.",
+                "low_implications": f"Low {name} is below healthy baseline reference corridor.",
+                "related_markers": [],
+            })
+
             line = parameter_explanation(
                 row["name"],
                 row["status"],
@@ -611,12 +754,35 @@ def analyze_text():
                     "unit": row.get("unit", ""),
                     "result_line": line,
                     "explanation": line,
+                    "organ_system": meta.get("organ_system", "General Physiology"),
+                    "clinical_function": meta.get("clinical_function", ""),
+                    "high_implications": meta.get("high_implications", ""),
+                    "low_implications": meta.get("low_implications", ""),
+                    "related_markers": meta.get("related_markers", []),
                 }
             )
 
         key_issues = [
             row["name"] for row in parameter_rows if str(row.get("status", "")).lower() in {"high", "low", "abnormal"}
         ]
+
+        # Doctor Consultation Questions
+        doctor_questions = build_doctor_consultation_questions(parameter_rows, risk_level, report_type)
+
+        # Organ Systems Overview
+        organ_systems = {}
+        for row in parameter_rows:
+            sys = row.get("organ_system", "General Physiology")
+            if sys not in organ_systems:
+                organ_systems[sys] = {"total": 0, "abnormal": 0, "markers": []}
+            organ_systems[sys]["total"] += 1
+            organ_systems[sys]["markers"].append(row["name"])
+            if str(row.get("status", "")).lower() in {"high", "low", "abnormal"}:
+                organ_systems[sys]["abnormal"] += 1
+
+        # Medication Interaction Screener
+        patient_meds = data.get("medications", [])
+        medication_alerts = screen_medication_interactions(patient_meds, parameter_rows)
 
         payload = {
             "report_type": report_type,
@@ -630,6 +796,9 @@ def analyze_text():
             "key_issues": key_issues,
             "suggestions": suggestions,
             "alerts": keyword_alerts,
+            "doctor_questions": doctor_questions,
+            "organ_systems": organ_systems,
+            "medication_alerts": medication_alerts,
         }
         payload = localize_analysis_payload(payload, language)
         return jsonify(payload)
@@ -637,7 +806,30 @@ def analyze_text():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/screen_medications", methods=["POST"])
+@app.route("/api/screen_medications", methods=["POST"])
+def screen_medications_endpoint():
+    data = request.get_json() or {}
+    meds = data.get("medications", [])
+    parameters = data.get("parameters", [])
+    results = screen_medication_interactions(meds, parameters)
+    return jsonify({
+        "medications": meds,
+        "interaction_alerts": results,
+        "supported_database": MEDICATION_INTERACTIONS_DATA,
+    })
+
+
+@app.route("/medications_list", methods=["GET"])
+@app.route("/api/medications_list", methods=["GET"])
+def medications_list_endpoint():
+    return jsonify({
+        "medications": MEDICATION_INTERACTIONS_DATA,
+    })
+
+
 @app.route("/compare", methods=["POST"])
+@app.route("/api/compare", methods=["POST"])
 def compare_reports():
     data = request.get_json() or {}
 
@@ -650,14 +842,18 @@ def compare_reports():
     if previous_id and not previous_text:
         previous = REPORT_STORE.get(previous_id)
         if not previous:
-            return jsonify({"error": "Invalid previous_report_id."}), 404
+            return jsonify({"error": "Previous report session expired or invalid ID. Please re-select report."}), 404
         previous_text = previous["text"]
+    elif previous_id and previous_text:
+        REPORT_STORE[previous_id] = {"filename": "prev.pdf", "text": previous_text}
 
     if current_id and not current_text:
         current = REPORT_STORE.get(current_id)
         if not current:
-            return jsonify({"error": "Invalid current_report_id."}), 404
+            return jsonify({"error": "Current report session expired or invalid ID. Please re-select report."}), 404
         current_text = current["text"]
+    elif current_id and current_text:
+        REPORT_STORE[current_id] = {"filename": "curr.pdf", "text": current_text}
 
     if not previous_text.strip() or not current_text.strip():
         return jsonify({"error": "Provide previous and current report text or report IDs."}), 400
@@ -681,4 +877,5 @@ def compare_reports():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000, use_reloader=False)
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+
