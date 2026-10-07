@@ -4,7 +4,15 @@
     "wbc": { "low": 4.0, "high": 11.0, "unit": "10^9/L" },
     "rbc": { "low": 4.2, "high": 6.1, "unit": "10^12/L" },
     "platelet": { "low": 150.0, "high": 450.0, "unit": "10^9/L" },
-    "esr": { "low": 0.0, "high": 20.0, "unit": "mm/hr" }
+    "esr": { "low": 0.0, "high": 20.0, "unit": "mm/hr" },
+    "hematocrit": { "low": 40.0, "high": 50.0, "unit": "%" },
+    "mcv": { "low": 80.0, "high": 100.0, "unit": "fL" },
+    "mch": { "low": 27.0, "high": 33.0, "unit": "pg" },
+    "mchc": { "low": 32.0, "high": 36.0, "unit": "g/dL" },
+    "neutrophils": { "low": 40.0, "high": 75.0, "unit": "%" },
+    "lymphocytes": { "low": 20.0, "high": 45.0, "unit": "%" },
+    "eosinophils": { "low": 1.0, "high": 6.0, "unit": "%" },
+    "monocytes": { "low": 2.0, "high": 10.0, "unit": "%" }
   },
   "Diabetes Report": {
     "glucose": { "low": 70.0, "high": 140.0, "unit": "mg/dL" },
