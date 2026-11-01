@@ -5,9 +5,15 @@ import shutil
 import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
-from flask import Flask, request, jsonify
+import copy
+from datetime import datetime
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+try:
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+except Exception:
+    AutoTokenizer = None
+    AutoModelForSeq2SeqLM = None
 try:
     from deep_translator import GoogleTranslator
 except Exception:
@@ -874,6 +880,91 @@ def compare_reports():
             "comparison": comparison,
         }
     )
+
+
+@app.route("/translate", methods=["POST"])
+@app.route("/api/translate", methods=["POST"])
+def translate_endpoint():
+    data = request.get_json() or {}
+    analysis = data.get("analysis")
+    target_lang = normalize_language(data.get("language", "en"))
+
+    if not analysis or not isinstance(analysis, dict):
+        return jsonify({"error": "Valid analysis payload required for translation."}), 400
+
+    if target_lang == "en":
+        return jsonify(analysis)
+
+    try:
+        cloned_analysis = copy.deepcopy(analysis)
+        translated_payload = localize_analysis_payload(cloned_analysis, target_lang)
+        return jsonify(translated_payload)
+    except Exception as e:
+        return jsonify({"error": f"Translation failed: {str(e)}"}), 500
+
+
+@app.route("/export_medical_report_pdf", methods=["POST"])
+@app.route("/api/export_medical_report_pdf", methods=["POST"])
+def export_medical_report_pdf_endpoint():
+    data = request.get_json() or {}
+    analysis = data.get("analysis")
+    if not analysis or not isinstance(analysis, dict):
+        return jsonify({"error": "Valid analysis payload required."}), 400
+
+    patient_info = data.get("patient_info", {})
+    language = normalize_language(data.get("language", "en"))
+
+    try:
+        from pdf_generator import generate_medical_report_pdf
+        pdf_bytes = generate_medical_report_pdf(analysis, patient_info=patient_info, language=language)
+        today = datetime.now().strftime("%Y-%m-%d")
+        filename = f"DiagnostiQ_Medical_Report_{today}.pdf"
+
+        return send_file(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        return jsonify({"error": f"PDF compilation failed: {str(e)}"}), 500
+
+
+@app.route("/export_consultation_prep_pdf", methods=["POST"])
+@app.route("/api/export_consultation_prep_pdf", methods=["POST"])
+def export_consultation_prep_pdf_endpoint():
+    data = request.get_json() or {}
+    analysis = data.get("analysis")
+    if not analysis or not isinstance(analysis, dict):
+        return jsonify({"error": "Valid analysis payload required."}), 400
+
+    patient_info = data.get("patient_info", {})
+    questions = data.get("questions", [])
+    checked_questions = data.get("checked_questions", {})
+    patient_notes = data.get("patient_notes", "")
+    language = normalize_language(data.get("language", "en"))
+
+    try:
+        from pdf_generator import generate_consultation_prep_pdf
+        pdf_bytes = generate_consultation_prep_pdf(
+            analysis,
+            patient_info=patient_info,
+            questions=questions,
+            checked_questions=checked_questions,
+            patient_notes=patient_notes,
+            language=language
+        )
+        today = datetime.now().strftime("%Y-%m-%d")
+        filename = f"DiagnostiQ_Consultation_Prep_{today}.pdf"
+
+        return send_file(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=filename
+        )
+    except Exception as e:
+        return jsonify({"error": f"Prep sheet compilation failed: {str(e)}"}), 500
 
 
 if __name__ == "__main__":

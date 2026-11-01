@@ -1,7 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import axios from 'axios';
-import html2canvas from 'html2canvas';
-import { jsPDF } from 'jspdf';
 import {
   BarChart,
   Bar,
@@ -623,6 +621,8 @@ function DoctorConsultationPrepSheet({
   setPatientNotes,
   copiedAgenda,
   onCopyAgenda,
+  onDownloadPdf,
+  isDownloadingPdf,
 }) {
   const abnormalParameters = (analysis?.parameters || []).filter((p) =>
     ['high', 'low', 'abnormal'].includes(String(p.status || '').toLowerCase())
@@ -688,6 +688,18 @@ function DoctorConsultationPrepSheet({
                 </>
               )}
             </button>
+
+            {onDownloadPdf && (
+              <button
+                onClick={onDownloadPdf}
+                disabled={isDownloadingPdf}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-xl bg-medteal-700 hover:bg-medteal-800 text-white shadow-card transition-all disabled:opacity-50"
+                title="Download Doctor Consultation Prep Sheet as PDF"
+              >
+                <Download className="w-3.5 h-3.5 text-white" />
+                <span>{isDownloadingPdf ? 'Generating...' : 'Download Prep PDF'}</span>
+              </button>
+            )}
 
             <button
               onClick={handlePrint}
@@ -1228,6 +1240,43 @@ function MindAndVitalitySection() {
   );
 }
 
+
+function findVoiceForLanguage(voices, lang) {
+  if (!voices || voices.length === 0) return null;
+  const cleanLang = (lang || 'en').toLowerCase();
+
+  let targets = [];
+  if (cleanLang === 'hi') {
+    targets = ['hi-in', 'hi_in', 'hi'];
+  } else if (cleanLang === 'ta') {
+    targets = ['ta-in', 'ta_in', 'ta'];
+  } else {
+    targets = ['en-in', 'en_in', 'en-us', 'en-gb', 'en'];
+  }
+
+  // 1. Exact or prefix match on voice.lang
+  for (const t of targets) {
+    const v = voices.find((voice) => voice.lang && voice.lang.toLowerCase().replace('_', '-').startsWith(t));
+    if (v) return v;
+  }
+
+  // 2. Name search heuristics for Hindi / Tamil / English
+  if (cleanLang === 'hi') {
+    const v = voices.find((voice) => /hindi|hi[-_]in|kalpana|hemant|swara|madhur|neerja/i.test(voice.name));
+    if (v) return v;
+  }
+  if (cleanLang === 'ta') {
+    const v = voices.find((voice) => /tamil|ta[-_]in|valluvar|iniya/i.test(voice.name));
+    if (v) return v;
+  }
+  if (cleanLang === 'en') {
+    const v = voices.find((voice) => /english|en[-_]|natural|zira|david|george|susan/i.test(voice.name));
+    if (v) return v;
+  }
+
+  return null;
+}
+
 export default function App() {
   // Navigation tabs
   const [activeTab, setActiveTab] = useState('analysis'); // 'analysis' | 'compare' | 'raw'
@@ -1254,7 +1303,13 @@ export default function App() {
   const [loadingUpload, setLoadingUpload] = useState(false);
   const [loadingAnalyze, setLoadingAnalyze] = useState(false);
   const [loadingCompare, setLoadingCompare] = useState(false);
-  const [exportingPdf, setExportingPdf] = useState(false);
+  const [canonicalAnalysis, setCanonicalAnalysis] = useState(null);
+  const translationCacheRef = useRef({});
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [availableVoices, setAvailableVoices] = useState([]);
+  const [voiceWarning, setVoiceWarning] = useState('');
+  const [exportingMedicalPdf, setExportingMedicalPdf] = useState(false);
+  const [exportingPrepPdf, setExportingPrepPdf] = useState(false);
   const [error, setError] = useState('');
   const [backendHealth, setBackendHealth] = useState(null);
 
@@ -1270,6 +1325,27 @@ export default function App() {
     callApi('get', '/health')
       .then((res) => setBackendHealth(res.data))
       .catch(() => setBackendHealth({ status: 'offline' }));
+  }, []);
+
+  // Initialize browser voices asynchronously
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.speechSynthesis) return;
+
+    const loadVoices = () => {
+      const v = window.speechSynthesis.getVoices();
+      if (v && v.length > 0) {
+        setAvailableVoices(v);
+      }
+    };
+
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+    return () => {
+      if (window.speechSynthesis) {
+        window.speechSynthesis.onvoiceschanged = null;
+        window.speechSynthesis.cancel();
+      }
+    };
   }, []);
 
   const selectedReport = reports.find((r) => r.report_id === selectedReportId);
@@ -1427,9 +1503,10 @@ export default function App() {
     }
   };
 
-  // Trigger analysis
+  // Trigger analysis - establishes canonical baseline and caches translations
   const handleAnalyze = async (overrideLang, overrideExplain) => {
-    // Strictly sanitize arguments so React Click Events or non-string values are never passed as language
+    if (loadingAnalyze) return; // Prevent duplicate concurrent requests
+
     const activeLang = typeof overrideLang === 'string' && overrideLang.trim() ? overrideLang.trim() : language;
     const activeExplain = typeof overrideExplain === 'boolean' ? overrideExplain : explainLike10;
 
@@ -1451,26 +1528,59 @@ export default function App() {
     setLoadingAnalyze(true);
     setError('');
 
+    // Cancel any active speech synthesis
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
+    }
+    setVoiceWarning('');
+
     try {
       const selectedReport = reports.find((r) => r.report_id === targetReportId);
       const reportText = selectedReport ? selectedReport.extracted_text : '';
 
+      // Establish canonical English analysis
       const payload =
         inputMode === 'upload'
           ? {
               report_id: targetReportId,
               text: reportText,
               explain_like_10: Boolean(activeExplain),
-              language: String(activeLang || 'en'),
+              language: 'en',
             }
           : {
               text: manualText,
               explain_like_10: Boolean(activeExplain),
-              language: String(activeLang || 'en'),
+              language: 'en',
             };
 
       const res = await callApi('post', '/analyze', payload);
-      setAnalysis(res.data);
+      const canonical = res.data;
+      setCanonicalAnalysis(canonical);
+      
+      // Seed cache with English canonical
+      translationCacheRef.current = { en: canonical };
+
+      // If non-English is selected, translate without re-running analysis
+      if (activeLang && activeLang !== 'en') {
+        setIsTranslating(true);
+        try {
+          const transRes = await callApi('post', '/translate', {
+            analysis: canonical,
+            language: activeLang,
+          });
+          translationCacheRef.current[activeLang] = transRes.data;
+          setAnalysis(transRes.data);
+        } catch (tErr) {
+          console.error('[Initial Translation Error]', tErr);
+          setAnalysis(canonical);
+        } finally {
+          setIsTranslating(false);
+        }
+      } else {
+        setAnalysis(canonical);
+      }
+
       setActiveTab('analysis');
     } catch (err) {
       console.error('[DiagnostiQ Analyze Error]', err);
@@ -1487,18 +1597,48 @@ export default function App() {
     }
   };
 
-  // Instant language change with live re-translation
-  const handleLanguageChange = (newLang) => {
+  // Fast language switching using client cache and dedicated /translate endpoint
+  // NEVER re-runs medical extraction, OCR, or /analyze!
+  const handleLanguageChange = async (newLang) => {
+    if (newLang === language) return;
     setLanguage(newLang);
-    if (analysis && (selectedReportId || manualText.trim())) {
-      handleAnalyze(newLang, explainLike10);
+    setVoiceWarning('');
+
+    // Cancel any playing audio immediately
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
+    }
+
+    if (!canonicalAnalysis) return;
+
+    // 1. Instant cache hit (<5ms)
+    if (translationCacheRef.current[newLang]) {
+      setAnalysis(translationCacheRef.current[newLang]);
+      return;
+    }
+
+    // 2. Fetch localized translation only
+    setIsTranslating(true);
+    try {
+      const res = await callApi('post', '/translate', {
+        analysis: canonicalAnalysis,
+        language: newLang,
+      });
+      translationCacheRef.current[newLang] = res.data;
+      setAnalysis(res.data);
+    } catch (err) {
+      console.error('[Translation Failure]', err);
+      setError(`Unable to translate to ${newLang === 'hi' ? 'Hindi' : newLang === 'ta' ? 'Tamil' : newLang}. Retaining original report.`);
+    } finally {
+      setIsTranslating(false);
     }
   };
 
   // Instant mode toggle with live re-analysis
   const handleExplainToggle = (checked) => {
     setExplainLike10(checked);
-    if (analysis && (selectedReportId || manualText.trim())) {
+    if (canonicalAnalysis && (selectedReportId || manualText.trim())) {
       handleAnalyze(language, checked);
     }
   };
@@ -1543,9 +1683,12 @@ export default function App() {
     }
   };
 
-  // Text-to-speech audio reader
+  // Text-to-speech audio reader with verified Hindi / Tamil / English voice support
   const toggleSpeech = () => {
-    if (!window.speechSynthesis) return;
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+      setVoiceWarning('Browser speech synthesis is not supported on this device.');
+      return;
+    }
 
     if (isSpeaking) {
       window.speechSynthesis.cancel();
@@ -1553,69 +1696,151 @@ export default function App() {
       return;
     }
 
-    const narrative = `${analysis?.one_line_summary || ''}. ${analysis?.simple_explanation || ''}. ${analysis?.why_it_matters || ''}`;
-    if (!narrative.trim()) return;
+    setVoiceWarning('');
 
-    const utterance = new SpeechSynthesisUtterance(narrative);
-    utterance.rate = 0.95;
-    utterance.pitch = 1.0;
-    if (language === 'hi') {
-      utterance.lang = 'hi-IN';
-    } else if (language === 'ta') {
-      utterance.lang = 'ta-IN';
-    } else {
-      utterance.lang = 'en-US';
+    const rawNarrative = `${analysis?.one_line_summary || ''}. ${analysis?.simple_explanation || ''}. ${analysis?.why_it_matters || ''}`;
+    const cleanNarrative = rawNarrative
+      .replace(/[*#•●▪]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!cleanNarrative) return;
+
+    const voices = availableVoices.length > 0 ? availableVoices : window.speechSynthesis.getVoices();
+    const currentLang = language || 'en';
+
+    // Locate verified voice for language
+    const voice = findVoiceForLanguage(voices, currentLang);
+
+    // Strictly validate language voice presence - never silently speak English!
+    if (currentLang === 'hi' && !voice) {
+      setVoiceWarning(
+        'A compatible Hindi speech voice is not installed on this browser/OS. To enable Hindi narration, please install the Hindi Language & Speech pack in Windows Settings > Time & Language > Speech, or open in Microsoft Edge/Chrome with Google Hindi TTS enabled.'
+      );
+      setIsSpeaking(false);
+      return;
     }
+
+    if (currentLang === 'ta' && !voice) {
+      setVoiceWarning(
+        'A compatible Tamil speech voice is not installed on this browser/OS. To enable Tamil narration, please install the Tamil Language & Speech pack in Windows Settings > Time & Language > Speech.'
+      );
+      setIsSpeaking(false);
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(cleanNarrative);
+    utterance.rate = 0.92;
+    utterance.pitch = 1.0;
+
+    if (voice) {
+      utterance.voice = voice;
+      utterance.lang = voice.lang;
+    } else {
+      utterance.lang = currentLang === 'hi' ? 'hi-IN' : currentLang === 'ta' ? 'ta-IN' : 'en-US';
+    }
+
+    utterance.onstart = () => setIsSpeaking(true);
     utterance.onend = () => setIsSpeaking(false);
-    utterance.onerror = () => setIsSpeaking(false);
+    utterance.onerror = (e) => {
+      console.warn('[Speech Synthesis Warning]', e);
+      setIsSpeaking(false);
+    };
 
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(utterance);
-    setIsSpeaking(true);
   };
 
-  // PDF Export
-  const handleExportPdf = async () => {
-    if (!dashboardRef.current) return;
+  // Structured PDF Export 1: Comprehensive Medical Diagnostic Report
+  const handleDownloadMedicalReportPdf = async () => {
+    if (!analysis) return;
 
     try {
-      setExportingPdf(true);
+      setExportingMedicalPdf(true);
       setError('');
 
-      const canvas = await html2canvas(dashboardRef.current, {
-        scale: 2,
-        useCORS: true,
-        backgroundColor: '#ffffff',
-        windowWidth: 1280,
+      const patientName = selectedReport?.filename
+        ? selectedReport.filename.replace(/\.[^/.]+$/, '').replace(/_/g, ' ')
+        : 'Patient Evaluation';
+
+      const payload = {
+        analysis,
+        patient_info: {
+          name: patientName,
+          gender: 'Not Specified',
+        },
+        language: language || 'en',
+      };
+
+      const response = await callApi('post', '/export_medical_report_pdf', payload, {
+        responseType: 'blob',
       });
 
-      const imgData = canvas.toDataURL('image/png');
-      const pdf = new jsPDF('p', 'mm', 'a4');
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-
-      const imgWidth = pageWidth;
-      const imgHeight = (canvas.height * imgWidth) / canvas.width;
-
-      let heightLeft = imgHeight;
-      let position = 0;
-
-      pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
-      heightLeft -= pageHeight;
-
-      while (heightLeft > 0) {
-        position = heightLeft - imgHeight;
-        pdf.addPage();
-        pdf.addImage(imgData, 'PNG', 0, position, imgWidth, imgHeight);
-        heightLeft -= pageHeight;
-      }
-
-      const filename = `clinical-summary-${analysis?.report_type ? analysis.report_type.toLowerCase().replace(/\s+/g, '-') : 'report'}-${new Date().toISOString().slice(0, 10)}.pdf`;
-      pdf.save(filename);
+      const blob = new Blob([response.data], { type: 'application/pdf' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const todayStr = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `DiagnostiQ_Medical_Report_${todayStr}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
     } catch (e) {
-      setError('PDF compilation failed. Please retry.');
+      console.error('[Medical Report PDF Generation Failed]', e);
+      setError('Medical Report PDF generation failed. Ensure backend service is reachable.');
     } finally {
-      setExportingPdf(false);
+      setExportingMedicalPdf(false);
+    }
+  };
+
+  // Structured PDF Export 2: Doctor Consultation Prep Sheet
+  const handleDownloadConsultationPrepPdf = async () => {
+    if (!analysis) return;
+
+    try {
+      setExportingPrepPdf(true);
+      setError('');
+
+      const patientName = selectedReport?.filename
+        ? selectedReport.filename.replace(/\.[^/.]+$/, '').replace(/_/g, ' ')
+        : 'Patient Agenda';
+
+      const allQuestions = [
+        ...(analysis?.doctor_questions || []),
+        ...customQuestions,
+      ];
+
+      const payload = {
+        analysis,
+        patient_info: {
+          name: patientName,
+        },
+        questions: allQuestions,
+        checked_questions: checkedQuestions,
+        patient_notes: patientDoctorNotes,
+        language: language || 'en',
+      };
+
+      const response = await callApi('post', '/export_consultation_prep_pdf', payload, {
+        responseType: 'blob',
+      });
+
+      const blob = new Blob([response.data], { type: 'application/pdf' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const todayStr = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `DiagnostiQ_Consultation_Prep_${todayStr}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('[Prep Sheet PDF Generation Failed]', e);
+      setError('Doctor Consultation Prep Sheet PDF generation failed. Please retry.');
+    } finally {
+      setExportingPrepPdf(false);
     }
   };
 
@@ -1733,16 +1958,29 @@ export default function App() {
               <span className="text-clinical-500">Multilingual</span>
             </div>
 
-            {/* PDF Export Button */}
+            {/* Professional PDF Export Actions */}
             {analysis && (
-              <button
-                onClick={handleExportPdf}
-                disabled={exportingPdf}
-                className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-lg bg-white border border-clinical-300 hover:border-clinical-400 hover:bg-clinical-50 text-clinical-800 shadow-sm transition-all"
-              >
-                <Download className="w-3.5 h-3.5 text-clinical-600" />
-                <span>{exportingPdf ? 'Exporting...' : 'Export PDF'}</span>
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleDownloadMedicalReportPdf}
+                  disabled={exportingMedicalPdf}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-medteal-700 hover:bg-medteal-800 text-white shadow-sm transition-all disabled:opacity-50"
+                  title="Download complete structured medical report as PDF"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>{exportingMedicalPdf ? 'Exporting Report...' : 'Download Medical Report PDF'}</span>
+                </button>
+
+                <button
+                  onClick={handleDownloadConsultationPrepPdf}
+                  disabled={exportingPrepPdf}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-white border border-clinical-300 hover:border-clinical-400 hover:bg-clinical-50 text-clinical-800 shadow-sm transition-all disabled:opacity-50"
+                  title="Download Doctor Consultation Preparation Sheet as PDF"
+                >
+                  <ClipboardList className="w-3.5 h-3.5 text-medteal-600" />
+                  <span>{exportingPrepPdf ? 'Exporting Prep...' : 'Download Consultation Prep Sheet PDF'}</span>
+                </button>
+              </div>
             )}
           </div>
         </div>
@@ -2041,14 +2279,17 @@ export default function App() {
                           <button
                             key={item.code}
                             onClick={() => handleLanguageChange(item.code)}
-                            disabled={loadingAnalyze}
-                            className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-all ${
+                            disabled={loadingAnalyze || isTranslating}
+                            className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-all flex items-center gap-1 ${
                               language === item.code
                                 ? 'bg-clinical-900 text-white shadow-subtle'
                                 : 'text-clinical-600 hover:text-clinical-900 hover:bg-clinical-100'
                             }`}
                           >
-                            {item.label}
+                            <span>{item.label}</span>
+                            {isTranslating && language === item.code && (
+                              <RefreshCw className="w-2.5 h-2.5 animate-spin text-medteal-300" />
+                            )}
                           </button>
                         ))}
                       </div>
@@ -2081,6 +2322,21 @@ export default function App() {
                         </div>
                       )}
                     </div>
+
+                    {voiceWarning && (
+                      <div className="w-full mt-2 p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-start justify-between gap-2">
+                        <div className="flex items-start gap-2">
+                          <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                          <p className="leading-relaxed">{voiceWarning}</p>
+                        </div>
+                        <button
+                          onClick={() => setVoiceWarning('')}
+                          className="text-amber-500 hover:text-amber-700 font-bold px-1"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    )}
                   </div>
 
                   {/* Plain Language & Clinical Context Grid */}
@@ -2367,6 +2623,8 @@ export default function App() {
                   setPatientNotes={setPatientDoctorNotes}
                   copiedAgenda={copiedAgenda}
                   onCopyAgenda={handleCopyAgenda}
+                  onDownloadPdf={handleDownloadConsultationPrepPdf}
+                  isDownloadingPdf={exportingPrepPdf}
                 />
 
                 {/* Mind & Vitality Quick Link Banner */}
